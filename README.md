@@ -1,11 +1,34 @@
-# nicola_repo
+# nicola pond lobotomy_games
 
+# Instrução de Execução
 Pra rodar os algoritmos você tem que coloca esta pasta dentro do src do repositorio do culling_games e buildar novamente -->
-
+```bash
+colcon build 
+```
+ou
+```bash
 colcon build --packages-select culling_controller
+```
+caso já tenha buildado o ambiente antes.
+
 
 e então setar o ambiente pra rodar -->
 
+```bash
 source install/setup.bash
+```
+Para a execução dos comandos é necessário dois terminais com tudo buildado. Um para rodar o jogo e outro para rodar o executavel.
+## Parte 1
 
-Com isso feito é pra Parte 1 é necessário rodar o comando ros2 run culling_controller path_follower, depois de buildar novamente, em outro terminal com o jogo rodando. Pra parte 2 é necessário os mesmos passo mas no final rodar o comando ros2 run culling_controller path_finder. 
+Pra Parte 1 é necessário rodar o comando 
+```bash
+ros2 run culling_controller path_follower
+```
+no segundo terminal
+
+## Parte 
+Pra Parte 2 é necessário rodar o comando 
+```bash
+ros2 run culling_controller path_finder. 
+```
+no segundo terminal.
