@@ -21,10 +21,13 @@ public:
     }
 
 private:
-    std::vector<std::vector<int>> grid; // matriz do mapa, 0 = livre, 1 = bloqueado, 2 = start, 3 = goal
+    static constexpr int MAP_SIZE = 200; // tamanho máximo do mapa
+
+    std::vector<std::vector<char>> internal_map; // mapa global com caracteres ('b'=bloqueado, 'f'=livre, '?'=desconhecido, 't'=target)
     std::vector<NodePos> path; // caminho calculado pelo Dijkstra
     size_t step_idx = 0; // índice atual do passo que o robô está seguindo
     bool map_loaded = false; // flag para indicar se o mapa já foi carregado
+    int map_rows = 0, map_cols = 0; // dimensões reais do mapa recebido
 
     void step() { 
         if (!map_loaded) { 
@@ -34,7 +37,7 @@ private:
         follow_path(); // se mapa já carregado, segue o caminho planejado
     }
 
-    // -------- MAP REQUEST ----------
+    // MAP REQUEST
     void request_map() {
         auto req = std::make_shared<cg_interfaces::srv::GetMap::Request>(); // cria requisição do serviço GetMap
 
@@ -43,13 +46,22 @@ private:
             [this](std::shared_future<cg_interfaces::srv::GetMap::Response::SharedPtr> future) {
                 auto res = future.get(); // pega a resposta do serviço
 
-                int rows = res->occupancy_grid_shape[0]; // número de linhas do mapa
-                int cols = res->occupancy_grid_shape[1]; // número de colunas do mapa
-                grid.assign(rows, std::vector<int>(cols)); // inicializa a matriz do mapa
+                map_rows = res->occupancy_grid_shape[0]; // número de linhas do mapa
+                map_cols = res->occupancy_grid_shape[1]; // número de colunas do mapa
+                
+                internal_map.assign(map_rows, std::vector<char>(map_cols, '?')); // inicializa internal_map com caracteres
 
-                for (int i = 0; i < rows; i++)
-                    for (int j = 0; j < cols; j++)
-                        grid[i][j] = std::stoi(res->occupancy_grid_flattened[i * cols + j]); // preenche a matriz a partir do vetor flatten
+                // Converte o grid recebido (0,1,2,3) para internal_map (caracteres)
+                for (int i = 0; i < map_rows; i++) {
+                    for (int j = 0; j < map_cols; j++) {
+                        int val = std::stoi(res->occupancy_grid_flattened[i * map_cols + j]); // pega valor do grid flatten
+                        
+                        if (val == 0) internal_map[i][j] = 'f'; // 0 = livre (free)
+                        else if (val == 1) internal_map[i][j] = 'b'; // 1 = bloqueado (blocked)
+                        else if (val == 2) internal_map[i][j] = 's'; // 2 = start
+                        else if (val == 3) internal_map[i][j] = 't'; // 3 = target/goal
+                    }
+                }
 
                 path = run_dijkstra(); // calcula o caminho usando Dijkstra
                 map_loaded = true; // marca que o mapa já foi carregado
@@ -59,22 +71,23 @@ private:
         );
     }
 
-    // -------- DIJKSTRA ----------
+    // DIJKSTRA
     std::vector<NodePos> run_dijkstra() {
-        int rows = grid.size(), cols = grid[0].size(); // pega dimensões do mapa
         NodePos start{}, goal{}; 
         bool foundT = false; // flag para indicar se achou o objetivo
 
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < cols; j++) {
-                if (grid[i][j] == 2) start = {i, j}; // célula de início
-                if (grid[i][j] == 3) { goal = {i, j}; foundT = true; } // célula do objetivo
+        // Procura start e goal no internal_map
+        for (int i = 0; i < map_rows; i++) {
+            for (int j = 0; j < map_cols; j++) {
+                if (internal_map[i][j] == 's') start = {i, j}; // célula de início (start)
+                if (internal_map[i][j] == 't') { goal = {i, j}; foundT = true; } // célula do objetivo (target)
             }
+        }
         if (!foundT) return {}; // se não encontrou objetivo, retorna caminho vazio
 
         const int INF = 1e9; 
-        std::vector<std::vector<int>> dist(rows, std::vector<int>(cols, INF)); // distância mínima conhecida
-        std::vector<std::vector<NodePos>> prev(rows, std::vector<NodePos>(cols, {-1, -1})); // guarda pai de cada célula para reconstruir caminho
+        std::vector<std::vector<int>> dist(map_rows, std::vector<int>(map_cols, INF)); // distância mínima conhecida
+        std::vector<std::vector<NodePos>> prev(map_rows, std::vector<NodePos>(map_cols, {-1, -1})); // guarda pai de cada célula para reconstruir caminho
 
         auto cmp = [&](NodePos a, NodePos b){ return dist[a.x][a.y] > dist[b.x][b.y]; }; // compara distâncias para prioridade
         std::priority_queue<NodePos, std::vector<NodePos>, decltype(cmp)> pq(cmp); // fila de prioridade do Dijkstra
@@ -91,8 +104,8 @@ private:
 
             for (int k = 0; k < 4; k++) { // percorre vizinhos ortogonais
                 int nx = u.x + dx[k], ny = u.y + dy[k];
-                if (nx < 0 || ny < 0 || nx >= rows || ny >= cols) continue; // checagem de borda
-                if (grid[nx][ny] == 1) continue; // ignora obstáculos
+                if (nx < 0 || ny < 0 || nx >= map_rows || ny >= map_cols) continue; // checagem de borda
+                if (internal_map[nx][ny] == 'b') continue; // ignora obstáculos (bloqueados)
 
                 int newcost = dist[u.x][u.y] + 1; // custo acumulado para vizinho
                 if (newcost < dist[nx][ny]) { // se custo é melhor que anterior
@@ -112,7 +125,7 @@ private:
         return p; // retorna caminho
     }
 
-    // -------- MOVE ROBOT ----------
+    // MOVE ROBOT
     std::string get_direction(NodePos a, NodePos b) { // calcula direção entre duas células ortogonais
         if (b.x == a.x + 1) return "down";
         if (b.x == a.x - 1) return "up";
