@@ -1,7 +1,7 @@
 # nicola pond lobotomy_games
 
 # Instrução de Execução
-Pra rodar os algoritmos você tem que coloca esta pasta dentro do src do repositorio do culling_games e buildar novamente -->
+Pra rodar os algoritmos você tem que coloca esta pasta dentro do src do repositorio do [culling_games](https://github.com/rmnicola/culling_games) e buildar novamente -->
 ```bash
 colcon build 
 ```
