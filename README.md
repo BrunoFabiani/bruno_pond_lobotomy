@@ -17,7 +17,7 @@ e então setar o ambiente pra rodar -->
 ```bash
 source install/setup.bash
 ```
-Para a execução dos comandos é necessário dois terminais com tudo buildado. Um para rodar o jogo e outro para rodar o executavel.
+Para a execução dos comandos é necessário dois terminais com tudo buildado e os ambientes preparados. Um para rodar o jogo e outro para rodar o executavel.
 ## Parte 1
 
 Pra Parte 1 é necessário rodar o comando 
