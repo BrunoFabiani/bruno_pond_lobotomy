@@ -1,387 +1,664 @@
 #include "rclcpp/rclcpp.hpp"
 #include "cg_interfaces/msg/robot_sensors.hpp"
+#include "cg_interfaces/srv/get_map.hpp"
 #include "cg_interfaces/srv/move_cmd.hpp"
 
-#include <vector>
 #include <queue>
+#include <vector>
+#include <string>
 #include <algorithm>
-#include <cmath>
-#include <fstream>
-#include <unordered_set>
+#include <memory>
+#include <future>
+#include <chrono>
+#include <thread>
 
-struct Pos { 
-    int x, y; 
-    bool operator==(const Pos& o) const { return x == o.x && y == o.y; } // operador de comparação para checar se duas posições são iguais
-};
-
-// Hash para usar Pos em unordered_set (evita processar células repetidas)
-struct PosHash {
-    size_t operator()(const Pos& p) const {
-        return std::hash<int>()(p.x) ^ (std::hash<int>()(p.y) << 1); // combina hash de x e y
+struct NodePos { 
+    int x, y;
+    bool operator==(const NodePos& other) const {
+        return x == other.x && y == other.y;
     }
 };
+
+enum class MoveStatus {
+    Success,
+    Failed,   // service responded with success=false
+    Timeout,  // no response in time
+};
+
 
 class Pathfinder : public rclcpp::Node {
 public:
-    Pathfinder() : Node("pathfinder") {
+    Pathfinder()
+    : Node("pathfinder_explore"),
+      map_size_(100),
+      rx_(map_size_/2), ry_(map_size_/2),
+      start_set_(false), goal_set_(false), exploring_(true),
+      executing_plan_(false), plan_step_(0)
+    {
+        // Assina sensores
         sensor_sub_ = create_subscription<cg_interfaces::msg::RobotSensors>(
-            "/culling_games/robot_sensors", 1,
-            std::bind(&Pathfinder::on_sensor, this, std::placeholders::_1) // manda a mensagem do sensor_sub pro on_sensor usar, o this indica qual objeto usar da classe pathfinder
-        ); // create_subscription recebe estes 3 argumentos
-
-        move_client_ = create_client<cg_interfaces::srv::MoveCmd>("move_command"); // faz o pathfinder virar cliente do move_command
-
-        internal_map.assign(MAP_SIZE, std::vector<char>(MAP_SIZE, '?')); // cria uma matriz com tamanho do MAP_SIZE x MAP_SIZE com ?. usa biblioteca vector
-        robot = {MAP_SIZE/2, MAP_SIZE/2}; // põe o robô no meio do mapa
-        internal_map[robot.x][robot.y] = 'f'; // marca o lugar do robô como f (livre)
-        start_pos = robot; // guarda posição inicial
+            "/culling_games/robot_sensors", 10,
+            std::bind(&Pathfinder::on_sensor, this, std::placeholders::_1)
+        );
         
-        RCLCPP_INFO(get_logger(), "=== PARTE 2: MAPEAMENTO COMPLETO DO LABIRINTO ===");
+        // NEW: helper node only for movement service calls
+        move_helper_node_ = rclcpp::Node::make_shared("pathfinder_move_helper");
+        move_client_primary_ = move_helper_node_->create_client<cg_interfaces::srv::MoveCmd>("/move_command");
+        
+        // keep /get_map client on this node
+        map_client_ = create_client<cg_interfaces::srv::GetMap>("/get_map");
+
+        // mapa desconhecido inicial: '?' = unknown, 'f','b','r','t'
+        map_.assign(map_size_, std::vector<char>(map_size_, '?'));
+        map_[rx_][ry_] = 'r';
+
+        // timer para passo do explorador
+        timer_ = create_wall_timer(
+            std::chrono::milliseconds(200),
+            std::bind(&Pathfinder::step, this)
+        );
+
+        RCLCPP_INFO(get_logger(), "Pathfinder explorer started. map_size=%d", map_size_);
+        RCLCPP_INFO(get_logger(), "Robot starting at (%d, %d)", rx_, ry_);
     }
 
-private: // callbacks e chamadas tem que serem feitas estritamente dentro da classe
-    // atributos da classe pathfinder
-    static constexpr int MAP_SIZE = 200; // constexpr é boa prática de programação
+private:
+    int map_size_;
+    int rx_, ry_;
+    NodePos start_, goal_;
+    bool start_set_, goal_set_;
+    bool exploring_;
+    
+    // Estado de execução de plano
+    bool executing_plan_;
+    size_t plan_step_;
+    std::vector<NodePos> current_plan_;
 
-    std::vector<std::vector<char>> internal_map; // como vector muda em tempo de execução posso deixar assim
-    Pos robot; // robô é do tipo que tem coordenadas
-    Pos start_pos; // guarda onde o robô começou
-    Pos finish_pos; // guarda onde está o objetivo
-    std::vector<Pos> path; // caminho que o robô irá seguir
-    size_t step_idx = 0; // índice do passo atual no caminho
-    bool finish_found = false; // flag pra indicar se encontrou o finish
-    bool mapping_complete = false; // flag pra indicar se terminou de mapear tudo
-    bool path_being_executed = false; // flag pra indicar se está seguindo um caminho
+    // NEW: helper node for blocking move calls
+    rclcpp::Node::SharedPtr move_helper_node_;
 
-    rclcpp::Subscription<cg_interfaces::msg::RobotSensors>::SharedPtr sensor_sub_; // criando o subscription, pegando da biblio do ros, configurado para lidar com mensagem do tipo RobotSensor
-    rclcpp::Client<cg_interfaces::srv::MoveCmd>::SharedPtr move_client_; // mesma lógica que o do serviço
+    std::vector<std::vector<char>> map_;
+    std::vector<std::vector<char>> map_true_from_service_;
 
-    // ========== SENSOR CALLBACK toca a operação ==========
+    rclcpp::Subscription<cg_interfaces::msg::RobotSensors>::SharedPtr sensor_sub_;
+    rclcpp::Client<cg_interfaces::srv::MoveCmd>::SharedPtr move_client_primary_;
+    rclcpp::Client<cg_interfaces::srv::GetMap>::SharedPtr map_client_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    // ---- sensores ----------------------------------------------------------------
     void on_sensor(const cg_interfaces::msg::RobotSensors::SharedPtr msg) {
-        update_map(msg); // atualiza o mapa com os dados do sensor
+        auto s = msg;
 
-        // Se já mapeou tudo, não faz nada
-        if (mapping_complete) return;
-
-        // Se está executando um caminho, continua movendo
-        if (path_being_executed && step_idx < path.size()) {
-            move_one_step();
-            return;
-        }
-
-        // Procura finish se ainda não encontrou
-        if (!finish_found) {
-            Pos finish = find_finish();
-            if (finish.x != -1) { // se encontrou (coordenadas válidas)
-                finish_found = true;
-                finish_pos = finish;
-                RCLCPP_INFO(get_logger(), "Finish encontrado em (%d, %d)", finish.x, finish.y);
-            }
-        }
-
-        // Continua mapeando mesmo depois de achar o finish (precisa explorar tudo)
-        std::vector<Pos> frontier = find_frontier_cells(); // acha células que podem ser exploradas
-        
-        if (frontier.empty()) { // se não há mais fronteiras, mapeamento completo
-            RCLCPP_INFO(get_logger(), "\n=== MAPEAMENTO COMPLETO! ===");
-            mapping_complete = true;
-            save_mapped_data(); // salva o mapa criado
-            reproduce_parte1_algorithm(); // reproduz o algoritmo da parte 1
-            return;
-        }
-
-        // Seleciona melhor fronteira e planeja caminho até ela
-        Pos best = select_closest_frontier(frontier); // pega a fronteira mais próxima
-        plan_path_dijkstra(robot, best); // calcula caminho usando Dijkstra
-        if (!path.empty()) { // se achou caminho válido
-            path_being_executed = true; // marca que está executando caminho
-            step_idx = 0; // reseta índice
-            move_one_step(); // começa a mover
-        }
-    }
-
-    // ========== MAP UPDATE ==========
-    void update_map(const cg_interfaces::msg::RobotSensors::SharedPtr msg) {
-        auto mark = [&](int dx, int dy, const std::string &val) { // [&] indica que esta lambda captura todas as variáveis do escopo externo por referência
-            char c = '?'; // ser uma lambda faz com que ele acesse o robot e internal_map sem problemas
-            if (val == "b") c = 'b'; // bloqueado
-            else if (val == "f") c = 'f'; // livre
-            else if (val == "t") c = 't'; // target/finish
-            int nx = robot.x + dx, ny = robot.y + dy; // calcula coordenadas do vizinho
-            if (nx >= 0 && nx < MAP_SIZE && ny >= 0 && ny < MAP_SIZE) { // checa se está dentro dos limites
-                internal_map[nx][ny] = c; // marca no mapa
+        auto set_if_valid = [&](int dx, int dy, const std::string& str){
+            if(str.empty()) return;
+            char c = str[0];
+            
+            int nx = rx_ + dx;
+            int ny = ry_ + dy;
+            
+            if(nx >= 0 && ny >= 0 && nx < map_size_ && ny < map_size_) {
+                // Atualiza a célula se ainda for desconhecida ou se for informação mais específica
+                if(map_[nx][ny] == '?' || c == 't') {
+                    map_[nx][ny] = c;
+                }
+                
+                if(c == 't') { 
+                    goal_ = {nx, ny}; 
+                    goal_set_ = true;
+                    RCLCPP_INFO(get_logger(), "Target found at (%d, %d)", nx, ny);
+                }
             }
         };
 
-        // marca no mapa todas as coisas que o sensor tá pegando e o robô pode ver
-        mark(-1, 0, msg->up);
-        mark(1, 0, msg->down);
-        mark(0, -1, msg->left);
-        mark(0, 1, msg->right);
-        internal_map[robot.x][robot.y] = 'f'; // marca a posição do robô como livre, já que ele está nela
-    }
+        // Atualiza células ao redor
+        set_if_valid(-1,  0, s->up);
+        set_if_valid( 1,  0, s->down);
+        set_if_valid( 0, -1, s->left);
+        set_if_valid( 0,  1, s->right);
+        set_if_valid(-1, -1, s->up_left);
+        set_if_valid(-1,  1, s->up_right);
+        set_if_valid( 1, -1, s->down_left);
+        set_if_valid( 1,  1, s->down_right);
 
-    // ========== FIND FINISH ==========
-    Pos find_finish() { // sempre checa se encontramos o final
-        for (int i = 0; i < MAP_SIZE; i++)
-            for (int j = 0; j < MAP_SIZE; j++)
-                if (internal_map[i][j] == 't') // se achou o target
-                    return {i, j};
-        return {-1, -1}; // como vector não tem coordenada negativa, isto basicamente sinaliza que não encontramos o final
-    }
-
-    // ========== FRONTIER ==========
-    bool has_unknown_neighbor(int x, int y) { // checa se tem vizinhos desconhecidos (fronteira)
-        if (x > 0 && internal_map[x-1][y] == '?') return true; // checa cima
-        if (x < MAP_SIZE-1 && internal_map[x+1][y] == '?') return true; // checa baixo
-        if (y > 0 && internal_map[x][y-1] == '?') return true; // checa esquerda
-        if (y < MAP_SIZE-1 && internal_map[x][y+1] == '?') return true; // checa direita
-        return false; // se chegou aqui, não tem vizinho desconhecido
-    }
-
-    std::vector<Pos> find_frontier_cells() { // acha as células que podem ser exploradas
-        std::vector<Pos> f;
-        f.reserve(1000); // pre-aloca memória pra evitar realocações
-        
-        for (int i = 0; i < MAP_SIZE; i++)
-            for (int j = 0; j < MAP_SIZE; j++)
-                if (internal_map[i][j] == 'f' && has_unknown_neighbor(i, j)) // se é livre e tem vizinho desconhecido
-                    f.push_back({i,j});
-        
-        return f; // depois de checar todas células do mapa, retorna f pras fronteiras
-    }
-
-    Pos select_closest_frontier(const std::vector<Pos> &f) { // checa os f's e pega o mais perto
-        Pos best = f[0]; // começa com o primeiro
-        int best_h = 1e9; // valor enorme pra garantir que qualquer distância seja menor
-        for (auto &p : f) { // percorre cada célula dentro do vetor
-            int h = std::abs(p.x - robot.x) + std::abs(p.y - robot.y); // distância Manhattan
-            if (h < best_h) { best_h = h; best = p; } // se achou melhor, atualiza
+        // Marca posição atual como livre/robot
+        map_[rx_][ry_] = 'r';
+        if(!start_set_) { 
+            start_ = {rx_, ry_}; 
+            start_set_ = true;
+            RCLCPP_INFO(get_logger(), "Start position set at (%d, %d)", rx_, ry_);
         }
-        return best; // retorna a fronteira mais próxima
     }
 
-    // ========== DIJKSTRA  ==========
-    void plan_path_dijkstra(const Pos &start, const Pos &goal) { // o mapa é constantemente re-atualizado, então ele está sempre calculando a melhor rota
-        static std::vector<std::vector<int>> dist(MAP_SIZE, std::vector<int>(MAP_SIZE)); // guarda o custo mínimo conhecido 
-        static std::vector<std::vector<Pos>> parent(MAP_SIZE, std::vector<Pos>(MAP_SIZE)); // guarda pai de cada célula pra reconstruir caminho
-        
-        const int INF = 1e9;
-        for (int i = 0; i < MAP_SIZE; i++)
-            for (int j = 0; j < MAP_SIZE; j++) {
-                dist[i][j] = INF; // inicializa com infinito
-                parent[i][j] = {-1, -1}; // sem pai no início
-            }
-
-        auto cmp = [&](Pos a, Pos b) { return dist[a.x][a.y] > dist[b.x][b.y]; }; // função de comparação para a fila de prioridade
-        std::priority_queue<Pos, std::vector<Pos>, decltype(cmp)> pq(cmp); // cria a priority queue que vai guardar o menor custo
-
-        dist[start.x][start.y] = 0; // distância do start é zero
-        pq.push(start); // adiciona start na fila
-
-        std::unordered_set<Pos, PosHash> visited; // evita processar células repetidas
-
-        while (!pq.empty()) { // enquanto houver células pra explorar
-            Pos u = pq.top(); pq.pop(); // pega célula com menor custo
-            
-            if (u.x == goal.x && u.y == goal.y) break; // se chegou no objetivo, para
-            if (visited.count(u)) continue; // se já visitou, pula
-            visited.insert(u); // marca como visitado
-
-            const int dx[4] = {1, -1, 0, 0}; 
-            const int dy[4] = {0, 0, 1, -1};
-            
-            for (int k = 0; k < 4; k++) { // percorre os 4 vizinhos ortogonais
-                int nx = u.x + dx[k], ny = u.y + dy[k]; // calcula as coordenadas reais do vizinho
-                
-                if (nx < 0 || nx >= MAP_SIZE || ny < 0 || ny >= MAP_SIZE) continue; // checagem de borda
-                if (internal_map[nx][ny] == 'b' || internal_map[nx][ny] == '?') continue; // não faz sentido ver vizinhos que não podem ser visitados
-                if (visited.count({nx, ny})) continue; // se já visitou, pula
-
-                int new_dist = dist[u.x][u.y] + 1; // como cada passo tem 1 de valor incrementamos 1 pro custo real acumulado
-                if (new_dist < dist[nx][ny]) { // se achou caminho melhor
-                    dist[nx][ny] = new_dist; // atualiza distância
-                    parent[nx][ny] = u; // marca pai
-                    pq.push({nx, ny}); // adiciona na fila
+    // ---- passo principal ---------------------------------------------------------
+            void step() {
+                    if (!start_set_) {
+                    return;
                 }
-            }
-        }
-
-        // Reconstrói caminho
-        path.clear(); // para garantir que não tenha nenhum caminho antigo armazenado
-        for (Pos p = goal; !(p.x == -1); p = parent[p.x][p.y]) { // com o p = parent ele vai pegando o pai de cada posição pra reconstruir o caminho
-            path.push_back(p); // vai adicionando o elemento p no final do vetor path
-            if (p == start) break; // se chegou no start, para
-        }
-        std::reverse(path.begin(), path.end()); // inverte pq isto vai pegando o pai de cada célula
-        
-        if (path.empty() || !(path[0] == start)) { // se caminho inválido
-            path.clear(); // limpa
-        }
-    }
-
-    // ========== MOVE ==========
-    void move_one_step() { // lógica pra mover o robô
-        if (path.empty() || step_idx + 1 >= path.size()) { // se não tem caminho ou chegou no final
-            path_being_executed = false; // para de executar
-            return;
-        }
-
-        Pos curr = path[step_idx], next = path[step_idx + 1]; // pega posição atual e próxima
-        std::string d; // direção do movimento
-
-        if (next.x == curr.x + 1) d = "down"; // se x aumenta, vai pra baixo
-        else if (next.x == curr.x - 1) d = "up"; // se x diminui, vai pra cima
-        else if (next.y == curr.y + 1) d = "right"; // se y aumenta, vai pra direita
-        else if (next.y == curr.y - 1) d = "left"; // se y diminui, vai pra esquerda
-        else { path_being_executed = false; return; } // movimento inválido
-
-        auto req = std::make_shared<cg_interfaces::srv::MoveCmd::Request>(); // cria requisição
-        req->direction = d; // seta direção
-
-        move_client_->async_send_request(
-            req,
-            [this, next](rclcpp::Client<cg_interfaces::srv::MoveCmd>::SharedFuture future) { // callback assíncrono
-                auto res = future.get(); // pega resposta
-                if (res->success) { // se movimento foi aceito
-                    robot = next; // atualiza posição do robô
-                    step_idx++; // avança pro próximo passo
-                    
-                    if (step_idx + 1 >= path.size()) { // se chegou no final do caminho
-                        path_being_executed = false; // libera pra novo planejamento
+            
+                // NEW: if we are standing on the goal, stop everything and verify
+                if (goal_set_ && rx_ == goal_.x && ry_ == goal_.y) {
+                    RCLCPP_INFO(get_logger(),
+                                "Goal reached at (%d,%d). Stopping exploration.",
+                                rx_, ry_);
+                    exploring_ = false;
+                    executing_plan_ = false;
+                    current_plan_.clear();
+                    timer_->cancel();
+                    verify_and_report();
+                    return;
+                }
+            
+                if (!exploring_) {
+                    return;
+                }
+            
+                // Se já está executando um plano, continua executando
+                if (executing_plan_) {
+                    if (plan_step_ >= current_plan_.size()) {
+                        // Plano concluído
+                        executing_plan_ = false;
+                        plan_step_ = 0;
+                        current_plan_.clear();
+                        RCLCPP_INFO(get_logger(), "Plan completed, searching for new frontier...");
+                        return;
                     }
-                } else { // se movimento falhou
-                    internal_map[next.x][next.y] = 'b'; // marca como obstáculo
-                    path_being_executed = false; // força replanejamento
+                
+                    // Executa próximo passo do plano
+                    if (plan_step_ > 0) {
+                        std::string dir = get_direction(current_plan_[plan_step_-1], current_plan_[plan_step_]);
+                        if (dir.empty()) {
+                            RCLCPP_WARN(get_logger(), "Invalid direction, aborting plan");
+                            executing_plan_ = false;
+                            plan_step_ = 0;
+                            current_plan_.clear();
+                            return;
+                        }
+                    
+                        MoveStatus status = send_move_and_wait(dir);
+                    
+                        if (status == MoveStatus::Timeout) {
+                            // Só avisa e tenta de novo no próximo tick
+                            RCLCPP_WARN(get_logger(), "Move timed out, will retry same step");
+                            return;
+                        }
+                    
+                        if (status == MoveStatus::Failed) {
+                            RCLCPP_WARN(get_logger(), "Move failed, marking target as blocked");
+
+                            if (!current_plan_.empty()) {
+                                NodePos blocked = current_plan_.back();
+                            
+                                // Again, don’t block the goal cell
+                                if (!(goal_set_ && blocked.x == goal_.x && blocked.y == goal_.y) &&
+                                    blocked.x >= 0 && blocked.y >= 0 &&
+                                    blocked.x < map_size_ && blocked.y < map_size_) {
+                                    map_[blocked.x][blocked.y] = 'b';
+                                    RCLCPP_INFO(get_logger(),
+                                                "Marked frontier (%d, %d) as blocked",
+                                                blocked.x, blocked.y);
+                                } else {
+                                    RCLCPP_WARN(get_logger(),
+                                                "Planned endpoint (%d,%d) is the goal; not marking as blocked",
+                                                blocked.x, blocked.y);
+                                }
+                            }
+                        
+                            executing_plan_ = false;
+                            plan_step_ = 0;
+                            current_plan_.clear();
+                            return;
+                        }
+
+                    
+                        // Success
+                        plan_step_++;
+                        return;
+                    } else {
+                        // Primeiro "passo" é só para alinhar índice
+                        plan_step_++;
+                        return;
+                    }
+                }
+            
+                // Não está executando plano, então busca nova frontier
+                auto frontier = find_frontiers();
+            
+                if (frontier.empty()) {
+                    exploring_ = false;
+                    RCLCPP_INFO(get_logger(), "Exploration completed!");
+                    verify_and_report();
+                    timer_->cancel();
+                    return;
+                }
+            
+                RCLCPP_INFO(get_logger(), "Found %zu frontiers, choosing best one...", frontier.size());
+            
+                // Escolhe frontier mais próxima que seja ALCANÇÁVEL
+                NodePos target = pick_nearest_frontier(frontier);
+            
+                if (target.x == -1) {
+                    RCLCPP_WARN(get_logger(), "No reachable frontier found, exploration may be complete");
+                    exploring_ = false;
+                    verify_and_report();
+                    timer_->cancel();
+                    return;
+                }
+            
+                RCLCPP_INFO(get_logger(), "Targeting frontier at (%d, %d)", target.x, target.y);
+            
+                // Planeja caminho
+                auto plan = run_dijkstra_on_known_map({rx_, ry_}, target);
+            
+                if (plan.empty()) {
+                    // Não conseguiu planejar para essa frontier
+                    map_[target.x][target.y] = 'b';
+                    RCLCPP_WARN(get_logger(),
+                                "Cannot plan to frontier (%d,%d) — marked as blocked, will try another",
+                                target.x, target.y);
+                    return;
+                }
+            
+                RCLCPP_INFO(get_logger(), "Plan has %zu steps", plan.size());
+            
+                // Inicia execução do plano
+                current_plan_ = plan;
+                executing_plan_ = true;
+                plan_step_ = 0;
+            }
+
+
+    // ---- frontiers & selection ---------------------------------------------------
+    std::vector<NodePos> find_frontiers() {
+        std::vector<NodePos> frontiers;
+        const int dx[4] = {1,-1,0,0};
+        const int dy[4] = {0,0,1,-1};
+        
+        for(int i = 0; i < map_size_; ++i) {
+            for(int j = 0; j < map_size_; ++j) {
+                // Só considera células livres ou do robô
+                if(map_[i][j] != 'f' && map_[i][j] != 'r') continue;
+                
+                // Verifica se qualquer vizinho é desconhecido '?'
+                bool is_frontier = false;
+                for(int k=0;k<4;++k){
+                    int ni = i + dx[k], nj = j + dy[k];
+                    if(ni<0||nj<0||ni>=map_size_||nj>=map_size_) continue;
+                    if(map_[ni][nj] == '?') { 
+                        is_frontier = true; 
+                        break; 
+                    }
+                }
+                
+                if(is_frontier) {
+                    frontiers.push_back({i,j});
                 }
             }
-        );
-    }
-
-    // ========== SAVE MAP ==========
-    void save_mapped_data() {
-        std::ofstream file("mapa_mapeado.txt"); // abre arquivo pra salvar
-        file << "=== MAPA CRIADO POR EXPLORAÇÃO (PARTE 2) ===\n";
-        file << "Start: (" << start_pos.x << ", " << start_pos.y << ")\n";
-        file << "Finish: (" << finish_pos.x << ", " << finish_pos.y << ")\n\n";
-
-        for (int i = 0; i < MAP_SIZE; i++) { // percorre linhas
-            for (int j = 0; j < MAP_SIZE; j++) { // percorre colunas
-                file << internal_map[i][j]; // escreve cada célula
-            }
-            file << "\n"; // pula linha
         }
-        file.close(); // fecha arquivo
-        RCLCPP_INFO(get_logger(), "Mapa salvo em 'mapa_mapeado.txt'");
+        
+        RCLCPP_INFO(get_logger(), "Found %zu frontiers", frontiers.size());
+        return frontiers;
     }
 
-    // ========== REPRODUZ ALGORITMO DA PARTE 1 ==========
-    void reproduce_parte1_algorithm() {
-        RCLCPP_INFO(get_logger(), "\n=== REPRODUZINDO ALGORITMO DA PARTE 1 ===");
-        RCLCPP_INFO(get_logger(), "Convertendo mapa mapeado para formato da Parte 1...");
+    NodePos pick_nearest_frontier(const std::vector<NodePos>& frontiers) {
+        size_t best_len = SIZE_MAX;
+        NodePos best = {-1, -1};
         
-        // Converte internal_map para grid (formato da Parte 1: 0=livre, 1=bloqueado, 2=start, 3=goal)
-        std::vector<std::vector<int>> grid(MAP_SIZE, std::vector<int>(MAP_SIZE));
+        for(const auto& f : frontiers) {
+            auto p = run_dijkstra_on_known_map({rx_, ry_}, f);
+            if(!p.empty() && p.size() < best_len) {
+                best_len = p.size();
+                best = f;
+            }
+        }
         
-        for (int i = 0; i < MAP_SIZE; i++) {
-            for (int j = 0; j < MAP_SIZE; j++) {
-                if (internal_map[i][j] == 'b' || internal_map[i][j] == '?') { // se é obstáculo ou desconhecido
-                    grid[i][j] = 1; // marca como bloqueado
-                } else if (internal_map[i][j] == 'f') { // se é livre
-                    grid[i][j] = 0; // marca como livre
-                } else if (internal_map[i][j] == 't') { // se é target
-                    grid[i][j] = 3; // marca como goal
+        // Se não encontrou nenhuma frontier alcançável, retorna a primeira mesmo assim
+        if(best.x == -1 && !frontiers.empty()) {
+            best = frontiers.front();
+        }
+        
+        return best;
+    }
+
+    // ---- Dijkstra sobre o mapa conhecido ----------------------------------------
+    std::vector<NodePos> run_dijkstra_on_known_map(NodePos start, NodePos goal) {
+        int rows = map_size_, cols = map_size_;
+        const int INF = 1e9;
+
+        std::vector<std::vector<int>> dist(rows, std::vector<int>(cols, INF));
+        std::vector<std::vector<NodePos>> prev(rows, std::vector<NodePos>(cols, {-1,-1}));
+
+        auto cmp = [&](NodePos a, NodePos b){ return dist[a.x][a.y] > dist[b.x][b.y]; };
+        std::priority_queue<NodePos, std::vector<NodePos>, decltype(cmp)> pq(cmp);
+
+        if(!is_walkable(start.x, start.y) || !is_walkable(goal.x, goal.y))
+            return {};
+
+        dist[start.x][start.y] = 0;
+        pq.push(start);
+
+        const int dx[4] = {1,-1,0,0};
+        const int dy[4] = {0,0,1,-1};
+
+        while(!pq.empty()) {
+            NodePos u = pq.top(); pq.pop();
+            
+            if(u.x == goal.x && u.y == goal.y) break;
+            
+            // Skip if we already found a better path
+            if(dist[u.x][u.y] < INF) {
+                for(int k=0;k<4;k++){
+                    int nx = u.x + dx[k];
+                    int ny = u.y + dy[k];
+                
+                    if(nx<0||ny<0||nx>=rows||ny>=cols) 
+                        continue;
+                
+                    if(!is_walkable(nx,ny)) 
+                        continue;
+                
+                    int newcost = dist[u.x][u.y] + 1;
+                
+                    if(newcost < dist[nx][ny]) {
+                        dist[nx][ny] = newcost;
+                        prev[nx][ny] = u;
+                        pq.push({nx,ny});
+                    }
+                }
+            }
+        }
+
+        // reconstrói caminho
+        std::vector<NodePos> path;
+        NodePos at = goal;
+
+        if(dist[goal.x][goal.y] == INF) {
+            return {};
+        }
+
+        while(at.x != -1 && at.y != -1) {
+            path.push_back(at);
+            if(at.x == start.x && at.y == start.y) break;
+            at = prev[at.x][at.y];
+        }
+
+        if(path.empty() || !(path.back().x == start.x && path.back().y == start.y))
+            return {};
+
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+
+    bool is_walkable(int x,int y) {
+        if(x<0||y<0||x>=map_size_||y>=map_size_) 
+            return false;
+
+        char c = map_[x][y];
+        return (c == 'f' || c == 'r' || c == 't');
+    }
+
+    // ---- movimento --------------------------------------------------------------
+MoveStatus send_move_and_wait(const std::string &dir) {
+    auto client = move_client_primary_;
+    if (!client->service_is_ready()) {
+        RCLCPP_WARN(get_logger(), "MoveCmd service not ready");
+        return MoveStatus::Timeout;
+    }
+
+    auto req = std::make_shared<cg_interfaces::srv::MoveCmd::Request>();
+    req->direction = dir;
+    auto future = client->async_send_request(req);
+
+    auto ret = rclcpp::spin_until_future_complete(
+        move_helper_node_, future, std::chrono::seconds(5));
+    if (ret != rclcpp::FutureReturnCode::SUCCESS) {
+        RCLCPP_WARN(get_logger(), "Timeout or error on move command");
+        return MoveStatus::Timeout;
+    }
+
+    auto res = future.get();
+    if (!res) {
+        RCLCPP_WARN(get_logger(), "Null response from move_command");
+        return MoveStatus::Timeout;
+    }
+
+    // Compute the intended target cell in *our* map
+    int tx = rx_, ty = ry_;
+    if (dir == "up")       tx -= 1;
+    else if (dir == "down") tx += 1;
+    else if (dir == "left") ty -= 1;
+    else if (dir == "right")ty += 1;
+    else {
+        RCLCPP_WARN(get_logger(), "Unknown direction '%s'", dir.c_str());
+        return MoveStatus::Failed;
+    }
+
+    if (!res->success) {
+        // Mark that cell as blocked (but don't block the goal)
+        if (tx >= 0 && ty >= 0 && tx < map_size_ && ty < map_size_) {
+            if (!(goal_set_ && tx == goal_.x && ty == goal_.y)) {
+                map_[tx][ty] = 'b';
+                RCLCPP_INFO(get_logger(),
+                            "Marked blocked due to failed move: (%d,%d)", tx, ty);
+            }
+        }
+        return MoveStatus::Failed;
+    }
+
+    // Success: move robot internally
+    int oldx = rx_, oldy = ry_;
+    if (oldx >= 0 && oldy >= 0 && oldx < map_size_ && oldy < map_size_) {
+        if (map_[oldx][oldy] == 'r') map_[oldx][oldy] = 'f';
+    }
+
+    rx_ = tx;
+    ry_ = ty;
+
+    if (rx_ >= 0 && ry_ >= 0 && rx_ < map_size_ && ry_ < map_size_) {
+        map_[rx_][ry_] = 'r';
+    }
+
+    RCLCPP_INFO(get_logger(), "Moved %s to (%d, %d)", dir.c_str(), rx_, ry_);
+    return MoveStatus::Success;
+}
+
+
+
+
+
+
+    std::string get_direction(const NodePos& a, const NodePos& b) {
+        if(b.x == a.x + 1) return "down";
+        if(b.x == a.x - 1) return "up";
+        if(b.y == a.y + 1) return "right";
+        if(b.y == a.y - 1) return "left";
+        return "";
+    }
+
+    // ---- verificação final ------------------------------------------------------
+    void verify_and_report() {
+        if(!start_set_ || !goal_set_) {
+            RCLCPP_WARN(get_logger(), "Start or goal not detected in mapped area. Cannot compare routes.");
+            return;
+        }
+
+        RCLCPP_INFO(get_logger(), "Running Dijkstra on mapped map...");
+        auto path_mapped = run_dijkstra_on_known_map(start_, goal_);
+        if(path_mapped.empty()) {
+            RCLCPP_ERROR(get_logger(), "Dijkstra on mapped map found no path!");
+        } else {
+            RCLCPP_INFO(get_logger(), "Path on mapped map: length=%ld", path_mapped.size());
+            
+            // Print the path
+            RCLCPP_INFO(get_logger(), "Path coordinates:");
+            for(size_t i = 0; i < path_mapped.size(); i++) {
+                RCLCPP_INFO(get_logger(), "  Step %zu: (%d, %d)", i, path_mapped[i].x, path_mapped[i].y);
+            }
+        }
+
+        // Tenta comparar com o mapa verdadeiro se disponível
+        if (map_client_->service_is_ready()) {
+            RCLCPP_INFO(get_logger(), "Requesting /get_map for verification...");
+            auto req = std::make_shared<cg_interfaces::srv::GetMap::Request>();
+        
+            auto prom = std::make_shared<std::promise<cg_interfaces::srv::GetMap::Response::SharedPtr>>();
+            auto fut  = prom->get_future();
+        
+            map_client_->async_send_request(
+                req,
+                [prom](rclcpp::Client<cg_interfaces::srv::GetMap>::SharedFuture future) {
+                    try {
+                        prom->set_value(future.get());
+                    } catch(...) {
+                        prom->set_value(nullptr);
+                    }
+                }
+            );
+        
+            auto status = fut.wait_for(std::chrono::seconds(5));
+            if (status == std::future_status::timeout) {
+                RCLCPP_WARN(get_logger(), "Timeout waiting for /get_map — cannot compare.");
+                return;
+            }
+        
+            auto res_ptr = fut.get();
+            if (!res_ptr) {
+                RCLCPP_WARN(get_logger(), "Null response from /get_map — cannot compare.");
+                return;
+            }
+        
+            // Processa o mapa verdadeiro e compara
+            compare_with_ground_truth(res_ptr, path_mapped);
+        } else {
+            RCLCPP_INFO(get_logger(), "/get_map not available — service verification not performed.");
+        }
+
+    }
+
+    void compare_with_ground_truth(
+        std::shared_ptr<cg_interfaces::srv::GetMap::Response> res_ptr,
+        const std::vector<NodePos>& path_mapped)
+    {
+        int rows = res_ptr->occupancy_grid_shape[0];
+        int cols = res_ptr->occupancy_grid_shape[1];
+        
+        RCLCPP_INFO(get_logger(), "Ground truth map size: %dx%d", rows, cols);
+        
+        // Converte para char map
+        std::vector<std::vector<char>> true_map(rows, std::vector<char>(cols, 'b'));
+        NodePos true_start{-1,-1}, true_goal{-1,-1};
+        
+        for(int i=0; i<rows; i++){
+            for(int j=0; j<cols; j++){
+                std::string cell = res_ptr->occupancy_grid_flattened[i*cols + j];
+                if(!cell.empty()) {
+                    char c = cell[0];
+                    true_map[i][j] = c;
+                    
+                    if(c == 'r' || c == 's') true_start = {i,j};
+                    if(c == 't') true_goal = {i,j};
                 }
             }
         }
         
-        grid[start_pos.x][start_pos.y] = 2; // marca o start
-        
-        RCLCPP_INFO(get_logger(), "Executando Dijkstra da Parte 1...");
-        
-        // Roda Dijkstra (mesmo código da Parte 1)
-        auto path_parte1 = run_dijkstra_parte1(grid, start_pos, finish_pos);
-        
-        if (path_parte1.empty()) { // se não achou caminho
-            RCLCPP_ERROR(get_logger(), "FALHA: Não foi possível reproduzir rota!");
+        if(true_start.x == -1 || true_goal.x == -1) {
+            RCLCPP_WARN(get_logger(), "Could not find start/goal in ground truth map.");
             return;
         }
         
-        RCLCPP_INFO(get_logger(), "✅ SUCESSO! Rota reproduzida com sucesso!");
-        RCLCPP_INFO(get_logger(), "Tamanho do caminho: %ld passos", path_parte1.size());
-        RCLCPP_INFO(get_logger(), "Start(%d,%d) -> Finish(%d,%d)", 
-                    start_pos.x, start_pos.y, finish_pos.x, finish_pos.y);
+        RCLCPP_INFO(get_logger(), "Ground truth: start=(%d,%d) goal=(%d,%d)", 
+                   true_start.x, true_start.y, true_goal.x, true_goal.y);
         
-        // Salva o caminho
-        std::ofstream pathfile("caminho_parte1_reproduzido.txt");
-        pathfile << "=== CAMINHO REPRODUZIDO USANDO ALGORITMO DA PARTE 1 ===\n";
-        pathfile << "Mapa usado: Mapa criado por exploração (Parte 2)\n";
-        pathfile << "Algoritmo: Dijkstra (mesmo da Parte 1)\n\n";
-        pathfile << "Start: (" << start_pos.x << ", " << start_pos.y << ")\n";
-        pathfile << "Finish: (" << finish_pos.x << ", " << finish_pos.y << ")\n";
-        pathfile << "Total de passos: " << path_parte1.size() << "\n\n";
+        // Roda Dijkstra no mapa verdadeiro
+        auto path_true = run_dijkstra_on_arbitrary_map(true_map, true_start, true_goal);
         
-        for (size_t i = 0; i < path_parte1.size(); i++) { // percorre cada passo
-            pathfile << "Passo " << i << ": (" << path_parte1[i].x << ", " << path_parte1[i].y << ")\n";
+        if(path_true.empty()) {
+            RCLCPP_ERROR(get_logger(), "Dijkstra on ground truth found no path!");
+        } else {
+            RCLCPP_INFO(get_logger(), "Path on ground truth: length=%ld", path_true.size());
         }
         
-        pathfile << "\n=== CONCLUSÃO ===\n";
-        pathfile << "O mapa criado durante a exploração (Parte 2) foi SUFICIENTE\n";
-        pathfile << "para reproduzir o algoritmo da Parte 1 e encontrar o caminho!\n";
-        
-        pathfile.close();
-        RCLCPP_INFO(get_logger(), "Caminho salvo em 'caminho_parte1_reproduzido.txt'");
-        RCLCPP_INFO(get_logger(), "\n=== PARTE 2 CONCLUÍDA COM SUCESSO! ===\n");
+        // Compara os caminhos
+        if(!path_mapped.empty() && !path_true.empty()) {
+            if(path_mapped.size() == path_true.size()) {
+                RCLCPP_INFO(get_logger(), "SUCCESS: Both paths have the same length!");
+            } else {
+                RCLCPP_WARN(get_logger(), "Path lengths differ: mapped=%ld, truth=%ld", 
+                           path_mapped.size(), path_true.size());
+            }
+        }
     }
 
-    // ========== DIJKSTRA ==========
-    std::vector<Pos> run_dijkstra_parte1(const std::vector<std::vector<int>> &grid,
-                                          const Pos &start, const Pos &goal) {
-        int rows = grid.size(), cols = grid[0].size(); // pega dimensões do mapa
+    std::vector<NodePos> run_dijkstra_on_arbitrary_map(
+        const std::vector<std::vector<char>>& amap,
+        NodePos start, NodePos goal)
+    {
+        int rows = amap.size();
+        if(rows == 0) return {};
+        int cols = amap[0].size();
         const int INF = 1e9;
-        std::vector<std::vector<int>> dist(rows, std::vector<int>(cols, INF)); // distância mínima conhecida
-        std::vector<std::vector<Pos>> prev(rows, std::vector<Pos>(cols, {-1, -1})); // guarda pai de cada célula para reconstruir caminho
+        
+        std::vector<std::vector<int>> dist(rows, std::vector<int>(cols, INF));
+        std::vector<std::vector<NodePos>> prev(rows, std::vector<NodePos>(cols, {-1,-1}));
 
-        auto cmp = [&](Pos a, Pos b){ return dist[a.x][a.y] > dist[b.x][b.y]; }; // compara distâncias para prioridade
-        std::priority_queue<Pos, std::vector<Pos>, decltype(cmp)> pq(cmp); // fila de prioridade do Dijkstra
+        auto cmp = [&](NodePos a, NodePos b){ return dist[a.x][a.y] > dist[b.x][b.y]; };
+        std::priority_queue<NodePos, std::vector<NodePos>, decltype(cmp)> pq(cmp);
 
-        dist[start.x][start.y] = 0; // distância inicial do start
-        pq.push(start); // adiciona start na fila
+        auto walkable = [&](int x,int y)->bool{
+            if(x<0||y<0||x>=rows||y>=cols) return false;
+            char c = amap[x][y];
+            return (c == 'f' || c == 'r' || c == 't' || c == 's');
+        };
 
-        const int dx[4] = {1, -1, 0, 0}; // movimentos ortogonais
-        const int dy[4] = {0, 0, 1, -1};
+        if(!walkable(start.x,start.y) || !walkable(goal.x,goal.y)) return {};
 
-        while (!pq.empty()) { // enquanto houver células para explorar
-            Pos u = pq.top(); pq.pop(); // pega célula com menor custo
-            if (u.x == goal.x && u.y == goal.y) break; // se chegou no objetivo, para
+        dist[start.x][start.y] = 0;
+        pq.push(start);
+        const int dx[4] = {1,-1,0,0};
+        const int dy[4] = {0,0,1,-1};
 
-            for (int k = 0; k < 4; k++) { // percorre vizinhos ortogonais
+        while(!pq.empty()) {
+            NodePos u = pq.top(); pq.pop();
+            if(u.x == goal.x && u.y == goal.y) break;
+            
+            for(int k=0;k<4;k++){
                 int nx = u.x + dx[k], ny = u.y + dy[k];
-                if (nx < 0 || ny < 0 || nx >= rows || ny >= cols) continue; // checagem de borda
-                if (grid[nx][ny] == 1) continue; // ignora obstáculos
-
-                int newcost = dist[u.x][u.y] + 1; // custo acumulado para vizinho
-                if (newcost < dist[nx][ny]) { // se custo é melhor que anterior
-                    dist[nx][ny] = newcost; // atualiza distância
-                    prev[nx][ny] = u; // marca pai
-                    pq.push({nx, ny}); // adiciona vizinho na fila
+                if(!walkable(nx,ny)) continue;
+                
+                int newcost = dist[u.x][u.y] + 1;
+                if(newcost < dist[nx][ny]) {
+                    dist[nx][ny] = newcost;
+                    prev[nx][ny] = u;
+                    pq.push({nx,ny});
                 }
             }
         }
 
-        std::vector<Pos> p;
-        for (Pos at = goal; at.x != -1; at = prev[at.x][at.y]) { // reconstrói caminho do objetivo para start
-            p.push_back(at); // adiciona célula ao caminho
-            if (at.x == start.x && at.y == start.y) break; // se chegou no start, para
+        std::vector<NodePos> p;
+        NodePos at = goal;
+        
+        if(dist[goal.x][goal.y] == INF) return {};
+        
+        while(at.x != -1 && at.y != -1) {
+            p.push_back(at);
+            if(at == start) break;
+            at = prev[at.x][at.y];
         }
-        std::reverse(p.begin(), p.end()); // inverte caminho para ficar start->goal
-        return p; // retorna caminho
+        
+        if(p.empty() || !(p.back() == start)) return {};
+        std::reverse(p.begin(), p.end());
+        return p;
     }
+
 };
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<Pathfinder>()); // cria o node Pathfinder e mantém ele ativo
+
+    auto node = std::make_shared<Pathfinder>();
+
+    rclcpp::executors::MultiThreadedExecutor exec;
+    exec.add_node(node);
+    exec.spin();
+
     rclcpp::shutdown();
     return 0;
 }
