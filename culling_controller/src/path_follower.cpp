@@ -15,7 +15,7 @@ public:
         move_client_ = create_client<cg_interfaces::srv::MoveCmd>("move_command");
 
         timer_ = create_wall_timer(
-            std::chrono::milliseconds(500),
+            std::chrono::milliseconds(50),
             std::bind(&Pathfinder::step, this)
         );
     }
@@ -69,10 +69,12 @@ private:
                 }
 
                 path = run_dijkstra();
-                if (path.empty())
+                if (path.empty()) {
                     RCLCPP_WARN(get_logger(), "No path found!");
-                else
-                    RCLCPP_INFO(get_logger(), "Path length: %ld", path.size());
+                }else {
+                    long moves = static_cast<long>(path.size()) - 1; // levando em conta que ele sempre adiciona um passo a mais
+                    RCLCPP_INFO(get_logger(), "Path length: %ld", moves);
+                }
 
                 map_loaded = true;
             }
@@ -148,7 +150,7 @@ private:
     }
 
     void follow_path() {
-        if(step_idx + 1 >= path.size()) return;
+        if(step_idx >= path.size()) return;
         NodePos curr = path[step_idx];
         NodePos next = path[step_idx+1];
         std::string dir = get_direction(curr,next);
