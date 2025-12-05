@@ -1,5 +1,5 @@
 # nicola pond lobotomy_games
-VIDEO --> video[https://drive.google.com/file/d/1b-5TlcbC-2aOEuwhcq2OQdwJfo8a6Cql/view?usp=sharing]
+VIDEO --> [video][https://drive.google.com/file/d/1b-5TlcbC-2aOEuwhcq2OQdwJfo8a6Cql/view?usp=sharing]
 # Instrução de Execução
 Pra rodar os algoritmos você tem que coloca esta pasta dentro do src do repositorio do [culling_games](https://github.com/rmnicola/culling_games) e buildar novamente -->
 ```bash
@@ -35,6 +35,6 @@ no segundo terminal.
 
 
 
-bonus:
+Imagens usadas:
 
 <img src='netero_domain_expension.png'>
