@@ -32,3 +32,9 @@ Pra Parte 2 é necessário rodar o comando
 ros2 run culling_controller path_finder. 
 ```
 no segundo terminal.
+
+
+
+bonus:
+
+<img src='netero_domain_expension.png'>
